@@ -35,6 +35,19 @@ def _sha(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+def _sha_lf(path: pathlib.Path) -> str:
+    """Same hash, but on LF-normalized content.
+
+    `data/checksums.json` records the hash of the LF bytes. A Windows checkout with
+    `core.autocrlf=true` materializes the very same corpus as CRLF, so `_sha` alone
+    reports every file as drifted and "eval sets unmodified" FAILs on a clean clone —
+    an integrity check that cries wolf gets ignored, which is worse than not having one.
+    A file only counts as changed when BOTH forms differ.
+    """
+    return hashlib.sha256(
+        path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()[:16]
+
+
 def _load_json(path: pathlib.Path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -178,7 +191,7 @@ def full() -> None:
     ref = _load_json(ROOT / "data" / "checksums.json")
     if ref:
         drift = [f for f, h in ref.items() if (ROOT / "data" / f).exists()
-                 and _sha(ROOT / "data" / f) != h]
+                 and h not in (_sha(ROOT / "data" / f), _sha_lf(ROOT / "data" / f))]
         if not drift:
             check("eval sets unmodified", OK)
         elif declared:

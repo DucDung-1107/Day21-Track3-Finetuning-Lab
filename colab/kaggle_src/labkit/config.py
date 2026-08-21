@@ -1,0 +1,288 @@
+"""Tier + model resolution for Lab 21 (Kaggle edition).
+
+One source of truth for "which model on which GPU". Everything else imports from here
+so a student changes `COMPUTE_TIER` in the notebook's CONFIG cell and the whole lab
+follows.
+
+Kaggle deltas:
+  * a `SMOKE` tier — the 0.8B checkpoint at T4 sequence settings, so the whole
+    notebook can be rehearsed end to end in ~25 minutes before the 4B run is
+    committed to. The repo's `CPU` tier is 0.8B too, but at `max_length=512`, which
+    truncates differently and therefore is not a rehearsal of the graded path.
+  * `$MODEL_ID` overrides the tier's checkpoint. Kaggle sessions die, quotas run
+    out, and hub IDs move; a run that cannot substitute a checkpoint without editing
+    library code is a run that cannot be finished.
+  * a `correct_replay` LoRA spec — same knobs as `correct`, different *data*. See
+    `labkit.replay`.
+
+Design note (deck §12): Unsloth's own Qwen3.5 guidance is *do not use QLoRA on this
+generation* — quantization error is higher than normal. So the default path here is
+**bf16 LoRA**, and 4-bit is something the student *measures* in NB4 rather than
+assumes. That is the opposite of the 2024-era lab this replaces.
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class Tier:
+    name: str
+    model_id: str
+    vram_gb_bf16_lora: float
+    max_length: int
+    per_device_batch: int
+    grad_accum: int
+    notes: str
+
+    @property
+    def effective_batch(self) -> int:
+        return self.per_device_batch * self.grad_accum
+
+
+# VRAM figures are the vendor's published bf16-LoRA minimums for the Qwen3.5 family
+# (0.8B→3GB, 2B→5GB, 4B→10GB, 9B→22GB, 27B→56GB). Keep them honest: if you change the
+# model, change the number, and re-measure with `torch.cuda.max_memory_allocated()`.
+TIERS: dict[str, Tier] = {
+    "CPU": Tier(
+        name="CPU",
+        model_id="Qwen/Qwen3.5-0.8B",
+        vram_gb_bf16_lora=0.0,
+        max_length=512,
+        per_device_batch=1,
+        grad_accum=8,
+        notes="No GPU. NB1 (data+mask) and the eval harness run here; training does not.",
+    ),
+    "LAPTOP": Tier(
+        name="LAPTOP",
+        model_id="Qwen/Qwen3.5-2B",
+        vram_gb_bf16_lora=5.0,
+        max_length=1024,
+        per_device_batch=1,
+        grad_accum=8,
+        notes="8-12 GB laptop GPU (RTX 3060/4060).",
+    ),
+    "T4": Tier(
+        name="T4",
+        model_id="unsloth/Qwen3.5-4B",
+        vram_gb_bf16_lora=10.0,
+        max_length=1024,
+        per_device_batch=1,
+        grad_accum=16,
+        notes="Free Colab T4 / Kaggle T4 (16 GB) — the default path for this lab.",
+    ),
+    # Kaggle addition. Not a hardware tier: the same T4, deliberately under-modelled so
+    # the notebook can be rehearsed end to end before ~3 hours of GPU quota is spent on
+    # the 4B run. Absolute scores from this tier are NOT comparable to T4's; the
+    # ORDERINGS are what a rehearsal is for.
+    "SMOKE": Tier(
+        name="SMOKE",
+        model_id="Qwen/Qwen3.5-0.8B",
+        vram_gb_bf16_lora=3.0,
+        max_length=1024,
+        per_device_batch=1,
+        grad_accum=16,
+        notes="Rehearsal tier: 0.8B at T4 sequence settings. Fast, not submittable.",
+    ),
+    "BIGGPU": Tier(
+        name="BIGGPU",
+        model_id="Qwen/Qwen3.5-9B",
+        vram_gb_bf16_lora=22.0,
+        max_length=2048,
+        per_device_batch=2,
+        grad_accum=8,
+        notes="L4 22.5 GB / A100 40 GB / RTX 3090-4090.",
+    ),
+}
+
+DEFAULT_TIER = "T4"
+
+
+def get_tier(name: str | None = None) -> Tier:
+    """Resolve the active tier from an argument, then $COMPUTE_TIER, then the default.
+
+    `$MODEL_ID`, when set, replaces the tier's checkpoint and leaves every other knob
+    alone. That is deliberate: sequence length, batch and grad-accum were chosen for the
+    *card*, not for the checkpoint, so swapping the model should not silently re-tune
+    them. The substitution is recorded in `results/run_config.json` so a report cannot
+    quietly claim a 4B number from a 0.8B run.
+    """
+    key = (name or os.environ.get("COMPUTE_TIER") or DEFAULT_TIER).upper()
+    if key not in TIERS:
+        raise ValueError(
+            f"Unknown COMPUTE_TIER={key!r}. Pick one of: {', '.join(TIERS)}"
+        )
+    tier = TIERS[key]
+    override = os.environ.get("MODEL_ID", "").strip()
+    if override and override != tier.model_id:
+        from dataclasses import replace
+        tier = replace(tier, model_id=override,
+                       notes=tier.notes + f" [MODEL_ID override: {override}]")
+    return tier
+
+
+# --- Training configuration -------------------------------------------------
+# The deck's §10 result: the learning rate should be set on the *scale* of ~10x the
+# full-fine-tune LR, and that scale matters more than the exact value. A full FT of a
+# 4B model sits near 1e-5, so LoRA lands near 1e-4.
+FULL_FT_LR = 1e-5
+LORA_LR_MULTIPLIER = 10.0
+LORA_LR = FULL_FT_LR * LORA_LR_MULTIPLIER          # 1e-4
+
+# §10.4: LoRA tolerates large batches worse than full FT, and raising rank does not
+# fix it. Keep the effective batch under 32.
+MAX_EFFECTIVE_BATCH = 32
+
+
+@dataclass(frozen=True)
+class LoraSpec:
+    """A named LoRA configuration. NB3 trains `correct`; NB4 trains the rest as contrasts."""
+    key: str
+    r: int | None          # None => computed to match `correct`'s parameter budget
+    alpha: int | None      # None => set to 2*r once r is known
+    target: str               # "text-linear" | "attn-only"
+    lr: float
+    load_in_4bit: bool
+    label: str
+    teaches: str
+
+    @property
+    def alpha_over_r(self) -> float | None:
+        if self.r is None or self.alpha is None:
+            return None
+        return self.alpha / self.r
+
+    def resolved(self, r: int) -> "LoraSpec":
+        """Fill in a computed rank (alpha follows the deck's 2r invariant, §9.3)."""
+        from dataclasses import replace
+        return replace(self, r=r, alpha=2 * r)
+
+
+SPECS: dict[str, LoraSpec] = {
+    "correct": LoraSpec(
+        key="correct", r=16, alpha=32, target="text-linear", lr=LORA_LR,
+        load_in_4bit=False,
+        label="all-linear · r=16 · LR 10x · 16-bit",
+        teaches="The deck's low-regret configuration (§10).",
+    ),
+    # r=None => resolved at runtime by modeling.matched_rank() so this run sits on the
+    # SAME trainable-parameter budget as `correct`. On Qwen3.5-4B that lands near r=90.
+    # Hardcoding a rank here would compare budgets instead of placements.
+    "attn_only": LoraSpec(
+        key="attn_only", r=None, alpha=None, target="attn-only", lr=LORA_LR,
+        load_in_4bit=False,
+        label="q,v only · r=matched · LR 10x · 16-bit",
+        teaches="Mistake #1 (§10.2): attention-only placement, rank raised to *match "
+                "parameter count*. If rank were the lever, this would win.",
+    ),
+    "wrong_lr": LoraSpec(
+        key="wrong_lr", r=16, alpha=32, target="text-linear", lr=FULL_FT_LR,
+        load_in_4bit=False,
+        label="all-linear · r=16 · LR 1x (full-FT scale) · 16-bit",
+        teaches="Mistake #2 (§10.3): a full-fine-tune learning rate applied to LoRA.",
+    ),
+    "qlora": LoraSpec(
+        key="qlora", r=16, alpha=32, target="text-linear", lr=LORA_LR,
+        load_in_4bit=True,
+        label="all-linear · r=16 · LR 10x · 4-bit QLoRA",
+        teaches="The vendor says do NOT use QLoRA on Qwen3.5 (§12). Measure the cost "
+                "yourself instead of taking either side on faith.",
+    ),
+    # --- Kaggle addition -----------------------------------------------------------
+    # Every LoRA knob is IDENTICAL to `correct`. The only variable is the training
+    # corpus: `correct` trains on triage tickets alone, `correct_replay` trains on the
+    # same tickets plus a small decontaminated slice of general instructions.
+    #
+    # This is the one contrast the repo pipeline is missing, and it is aimed at the one
+    # defect the repo's own findings measured and left open: the fine-tune's general
+    # capability fell from 0.644 to 0.067 because a corpus of nothing but
+    # `ticket -> JSON` teaches the model that ANY input means "emit triage JSON".
+    # Deck §14.3 names the remedy (1-5% replay); nothing in the lab tested it.
+    "correct_replay": LoraSpec(
+        key="correct_replay", r=16, alpha=32, target="text-linear", lr=LORA_LR,
+        load_in_4bit=False,
+        label="all-linear · r=16 · LR 10x · 16-bit · + replay mix",
+        teaches="Deck §14.3: the anti-forgetting remedy, as a controlled contrast. One "
+                "variable versus `correct` — the DATA, not the LoRA configuration.",
+    ),
+}
+
+
+# Fraction of the mixed training corpus that is replay (general-instruction) data.
+# Deck §14.3 says 1-5%. The measured collapse on this corpus is total rather than
+# partial, so the default sits at the top of that band and is a knob, not a constant:
+# REPLAY_FRACTION is one of the things the report is expected to have an opinion about.
+REPLAY_FRACTION_DEFAULT = 0.05
+
+
+def replay_fraction(override: float | None = None) -> float:
+    if override is not None:
+        return float(override)
+    raw = os.environ.get("REPLAY_FRACTION", "").strip()
+    frac = float(raw) if raw else REPLAY_FRACTION_DEFAULT
+    if not 0.0 <= frac < 0.5:
+        raise ValueError(
+            f"REPLAY_FRACTION={frac} is outside [0, 0.5). Above ~0.2 you are no longer "
+            "running an anti-forgetting mix, you are training a different task."
+        )
+    return frac
+
+
+# --- prompts -----------------------------------------------------------------------
+# These live here, not in generate.py, because BOTH training and evaluation need them
+# and holding two copies is how F-31 happened: the lab trained on one prompt shape and
+# scored on another, and every adapter came out at target=0.000.
+NAIVE_PROMPT = "Phân loại ticket sau."
+
+OPTIMIZED_PROMPT = """Bạn là hệ thống phân loại ticket CSKH. Trả về DUY NHẤT một object JSON, không kèm giải thích, không kèm markdown fence.
+
+Schema bắt buộc — đúng 4 khóa:
+{"intent": ..., "urgency": ..., "product": ..., "sentiment": ...}
+
+intent    ∈ doi_tra | van_chuyen | hoan_tien | san_pham_loi | hoi_thong_tin
+urgency   ∈ cao | trung_binh | thap
+sentiment ∈ tieu_cuc | trung_tinh | tich_cuc
+product   = tên sản phẩm xuất hiện nguyên văn trong ticket
+
+Ví dụ:
+Ticket: "Shop ơi, mình đặt bàn phím cơ mã đơn DH123456. Giao hàng chậm. Đã 3 ngày rồi. Nhờ shop kiểm tra."
+JSON: {"intent": "van_chuyen", "urgency": "trung_binh", "product": "bàn phím cơ", "sentiment": "trung_tinh"}"""
+
+
+CONTRAST_KEYS = ["attn_only", "wrong_lr", "qlora"]
+
+# Every run that must land on the SAME optimizer-step budget to be comparable. The
+# replay run is in here for the same reason the misconfig contrasts are: it differs from
+# `correct` in exactly one variable, and the step count is not allowed to be a second
+# one. Note that a replay mix makes the corpus LARGER, so `correct_replay` cannot derive
+# its step count from its own length — it has to be handed `correct`'s.
+GRADED_KEYS = ["correct", "correct_replay", *CONTRAST_KEYS]
+
+EPOCHS_DEFAULT = 2.0
+
+
+def training_epochs(override: float | None = None) -> float:
+    """The epoch budget -- ONE number, shared by NB3's baseline and NB4's contrasts.
+
+    NB4's contrasts must run the SAME number of optimizer steps as NB3's `correct` run,
+    otherwise the autopsy measures step budget instead of configuration. Both notebooks
+    turn this into a step count with `train.planned_steps(n_examples, tier, epochs)`.
+
+    Why a function and not two constants. This started as `CONTRAST_MAX_STEPS = 60`,
+    calibrated against a "~10 minutes" estimate; measured on a free-Colab T4 at 48.5
+    s/step that is 48 minutes per contrast, and 2x the 30 steps NB3 actually runs -- so
+    every contrast was trained twice as long as the baseline it is compared against.
+    The first fix made both notebooks derive the count, but left NB3 reading $EPOCHS
+    while NB4 read a frozen constant: setting `EPOCHS=1` re-opened the same divergence
+    through the front door. One reader, one env var, no way to set half of it.
+
+    `EPOCHS=1` is the supported lever when you are time-boxed -- it halves NB3 *and*
+    NB4. Submit with the default, and `scripts/verify.py` cross-checks the step budget
+    recorded in `results/runs.csv` so the fairness of the comparison is a checked fact
+    rather than a promise.
+    """
+    if override is not None:
+        return float(override)
+    raw = os.environ.get("EPOCHS", "").strip()
+    return float(raw) if raw else EPOCHS_DEFAULT
