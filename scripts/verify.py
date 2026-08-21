@@ -90,7 +90,8 @@ def smoke() -> None:
     # NOTE: pyproject sets addopts="-q". Passing -q again yields -qq, which hides the
     # summary line. Use -rN + --tb=no and let the configured -q stand.
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", str(ROOT / "tests"), "--tb=no", "-rN"],
+        [sys.executable, "-m", "pytest", str(ROOT / "tests"), "--tb=no", "-rN",
+         "--basetemp", str(ROOT / ".pytest-verify")],
         capture_output=True, text=True, cwd=ROOT)
     lines = [l.strip() for l in (proc.stdout or proc.stderr).splitlines() if l.strip()]
     # The last line may be pytest's progress dots; the summary is the line that reports
@@ -260,6 +261,11 @@ def full() -> None:
 
 
 def main() -> int:
+    # Colab/Linux use UTF-8, but Windows PowerShell can expose a cp1252 stdout.
+    # Verification details include Vietnamese text; do not crash while reporting
+    # missing artifacts or other failures just because the console cannot encode it.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true", help="imports + data + tests only")
     args = ap.parse_args()
