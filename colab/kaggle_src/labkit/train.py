@@ -29,6 +29,17 @@ from .config import MAX_EFFECTIVE_BATCH, LoraSpec, Tier
 WARMUP_FRACTION = 0.1
 
 
+def chunked_nll_supported() -> bool:
+    """Whether TRL's chunked CE patch is safe on the installed Torch runtime."""
+    try:
+        import torch
+        version = torch.__version__.split("+", 1)[0]
+        major, minor = (int(x) for x in version.split(".")[:2])
+        return (major, minor) >= (2, 11)
+    except Exception:
+        return True
+
+
 def planned_steps(n_examples: int, tier: Tier, epochs: float) -> int:
     """Optimizer steps that `epochs` over `n_examples` takes on `tier`.
 

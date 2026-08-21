@@ -85,6 +85,9 @@ def run_contrast(key: str) -> dict:
     max_steps = train.planned_steps(len(train_ds), TIER, training_epochs())
     want = train.sft_config_kwargs(TIER, spec, str(ROOT / "adapters" / key),
                                    max_steps=max_steps)
+    if not train.chunked_nll_supported():
+        want["loss_type"] = "default"
+        print("Torch < 2.11: using loss_type='default' (TRL compatibility fallback)")
     sft_kwargs, _ = train.filter_kwargs(SFTConfig, want, label=f"SFTConfig[{key}]")
     lora_kwargs, _ = train.filter_kwargs(
         LoraConfig, train.lora_config_kwargs(spec, targets), label=f"LoraConfig[{key}]")

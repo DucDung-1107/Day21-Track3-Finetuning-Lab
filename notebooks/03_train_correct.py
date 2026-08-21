@@ -120,6 +120,9 @@ want_sft = train.sft_config_kwargs(
     num_train_epochs=EPOCHS, mask_mode=MASK_MODE,
     total_steps=STEPS,
 )
+if not train.chunked_nll_supported():
+    want_sft["loss_type"] = "default"
+    print("Torch < 2.11: using loss_type='default' (TRL compatibility fallback)")
 sft_kwargs, dropped = train.filter_kwargs(SFTConfig, want_sft, label="SFTConfig")
 if dropped:
     print("⚠ TRL không nhận:", dropped)
